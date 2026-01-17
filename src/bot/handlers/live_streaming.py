@@ -6,6 +6,7 @@ showing tools being used, todos, and progress with a cancel button.
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -28,9 +29,15 @@ class LiveStreamContext:
 
     # Message tracking
     status_message: Optional[Message] = None
+    content_message: Optional[Message] = None  # Main response message
     tool_messages: Dict[str, Message] = field(default_factory=dict)
     todo_message: Optional[Message] = None
     current_todos: List[Dict] = field(default_factory=list)
+
+    # Content streaming
+    accumulated_content: str = ""
+    last_update_time: float = 0.0
+    update_throttle: float = 0.3  # Update every 300ms max
 
     # Control
     cancel_requested: bool = False
@@ -132,18 +139,84 @@ class LiveStreamHandler:
         context: LiveStreamContext,
         update: StreamUpdate
     ):
-        """Handle assistant message - check for todos and send as separate message."""
-        content = update.content
+        """Handle assistant message - stream content live to Telegram."""
+        if not update.content:
+            return
 
-        # Extract todos from message
-        todos = self._extract_todos(content)
+        # Accumulate content
+        context.accumulated_content += update.content
+
+        # Extract todos from accumulated message
+        todos = self._extract_todos(context.accumulated_content)
         if todos and todos != context.current_todos:
             context.current_todos = todos
             await self._update_todo_display(context, todos)
 
-        # Update status message
-        preview = content[:100] + "..." if len(content) > 100 else content
-        await self._update_status(context, f"💬 **Claude is responding...**\n\n_{preview}_")
+        # Throttle updates to avoid hitting Telegram rate limits
+        # Update every 300ms or when content is substantial
+        current_time = time.time()
+        time_since_update = current_time - context.last_update_time
+        content_length = len(context.accumulated_content)
+
+        should_update = (
+            time_since_update >= context.update_throttle or
+            content_length % 200 == 0  # Update every ~200 chars
+        )
+
+        if should_update:
+            await self._update_content_message(context)
+            context.last_update_time = current_time
+
+    async def _update_content_message(
+        self,
+        context: LiveStreamContext
+    ):
+        """Update or create the content message with accumulated text."""
+        if not context.accumulated_content:
+            return
+
+        # Prepare content with stop button
+        keyboard = [[InlineKeyboardButton("🛑 Stop", callback_data=f"cancel:{context.process_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Truncate if too long (Telegram limit is 4096 chars)
+        content = context.accumulated_content
+        if len(content) > 4000:
+            content = content[:4000] + "\n\n_...response continues..._"
+
+        try:
+            if context.content_message:
+                # Update existing message
+                await context.content_message.edit_text(
+                    content,
+                    parse_mode="Markdown",
+                    reply_markup=reply_markup
+                )
+            else:
+                # Create new content message
+                context.content_message = await self.bot.send_message(
+                    chat_id=context.chat_id,
+                    text=content,
+                    parse_mode="Markdown",
+                    reply_markup=reply_markup
+                )
+                context.messages_sent += 1
+
+                # Update status to show we're streaming
+                await self._update_status(context, "💬 **Streaming response...**")
+
+        except Exception as e:
+            # Fallback to plain text if markdown fails
+            try:
+                if context.content_message:
+                    await context.content_message.edit_text(content)
+                else:
+                    context.content_message = await self.bot.send_message(
+                        chat_id=context.chat_id,
+                        text=content
+                    )
+            except Exception as e2:
+                logger.warning("Failed to update content message", error=str(e2))
 
     async def _handle_tool_calls(
         self,
@@ -352,6 +425,17 @@ class LiveStreamHandler:
         if not context:
             return
 
+        # Do final update of content message
+        if context.accumulated_content:
+            await self._update_content_message(context)
+
+        # Remove stop button from content message
+        if context.content_message:
+            try:
+                await context.content_message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
         # Update status message with final state
         if context.status_message:
             try:
@@ -374,7 +458,8 @@ class LiveStreamHandler:
             "Finalized stream",
             process_id=process_id,
             messages_sent=context.messages_sent,
-            tools_used=context.tools_count
+            tools_used=context.tools_count,
+            content_length=len(context.accumulated_content)
         )
 
         # Clean up
