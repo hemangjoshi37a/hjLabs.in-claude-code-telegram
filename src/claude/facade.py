@@ -458,6 +458,18 @@ class ClaudeIntegration:
 
         return "\n".join(instructions)
 
+    async def kill_current_process(self) -> bool:
+        """Kill the currently running Claude process immediately.
+
+        Returns:
+            True if a process was killed, False if no process was running
+        """
+        if self.process_manager and self.process_manager.current_process_id:
+            process_id = self.process_manager.current_process_id
+            logger.info("Killing current Claude process", process_id=process_id)
+            return await self.process_manager.kill_process(process_id)
+        return False
+
     def _create_tool_error_message(
         self,
         blocked_tools: List[str],

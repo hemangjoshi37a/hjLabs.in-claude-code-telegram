@@ -9,6 +9,7 @@ Features:
 
 import asyncio
 import json
+import signal
 import uuid
 from asyncio.subprocess import Process
 from collections import deque
@@ -95,12 +96,50 @@ class ClaudeProcessManager:
         """Initialize process manager with configuration."""
         self.config = config
         self.active_processes: Dict[str, Process] = {}
+        self.current_process_id: Optional[str] = None  # Track current process for cancellation
 
         # Memory optimization settings
         self.max_message_buffer = 1000  # Limit message history
         self.streaming_buffer_size = (
             65536  # 64KB streaming buffer for large JSON messages
         )
+
+    async def kill_process(self, process_id: str) -> bool:
+        """Kill an active process immediately (like pressing ESC twice).
+
+        Args:
+            process_id: The process ID to kill
+
+        Returns:
+            True if process was killed, False if not found
+        """
+        if process_id in self.active_processes:
+            process = self.active_processes[process_id]
+            try:
+                # Send SIGINT (like Ctrl+C / ESC)
+                process.send_signal(signal.SIGINT)
+
+                # Wait a brief moment
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    # If still running, send another SIGINT (like ESC twice)
+                    process.send_signal(signal.SIGINT)
+
+                    # Wait again
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        # Force kill if still not responding
+                        process.kill()
+                        await process.wait()
+
+                logger.info("Process killed successfully", process_id=process_id)
+                return True
+            except Exception as e:
+                logger.error("Error killing process", process_id=process_id, error=str(e))
+                return False
+        return False
 
     async def execute_command(
         self,
@@ -129,6 +168,7 @@ class ClaudeProcessManager:
             # Start process
             process = await self._start_process(cmd, working_directory)
             self.active_processes[process_id] = process
+            self.current_process_id = process_id  # Track for cancellation
 
             # Handle output with timeout
             result = await asyncio.wait_for(

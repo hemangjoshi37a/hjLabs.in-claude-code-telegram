@@ -1153,15 +1153,22 @@ async def handle_cancel_callback(
     user_id = query.from_user.id
 
     try:
-        if _live_stream_handler:
-            # Request cancellation
-            cancelled = _live_stream_handler.request_cancel(process_id)
+        # Get Claude integration to kill the process
+        claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
 
-            if cancelled:
-                await query.answer("🛑 Stopping Claude...", show_alert=True)
-                logger.info("User requested cancellation", user_id=user_id, process_id=process_id)
+        if claude_integration:
+            # Kill the Claude process immediately (like ESC ESC)
+            killed = await claude_integration.kill_current_process()
+
+            if killed:
+                # Also mark as cancelled in live stream handler
+                if _live_stream_handler:
+                    _live_stream_handler.request_cancel(process_id)
+
+                await query.answer("🛑 Claude stopped!", show_alert=True)
+                logger.info("User stopped Claude process", user_id=user_id, process_id=process_id)
             else:
-                await query.answer("⚠️ Operation not found or already completed", show_alert=True)
+                await query.answer("⚠️ No active process to stop", show_alert=True)
         else:
             await query.answer("❌ Cancellation not available", show_alert=True)
 
