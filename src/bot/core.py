@@ -90,10 +90,14 @@ class ClaudeCodeBot:
             BotCommand("cd", "Change directory"),
             BotCommand("pwd", "Show current directory"),
             BotCommand("projects", "Show all projects"),
+            BotCommand("recent", "Show recent projects"),
             BotCommand("status", "Show session status"),
             BotCommand("export", "Export current session"),
             BotCommand("actions", "Show quick actions"),
             BotCommand("git", "Git repository commands"),
+            BotCommand("q", "Quick status (alias for /status)"),
+            BotCommand("s", "Session status (alias for /status)"),
+            BotCommand("n", "New session (alias for /new)"),
         ]
 
         await self.app.bot.set_my_commands(commands)
@@ -102,6 +106,12 @@ class ClaudeCodeBot:
     def _register_handlers(self) -> None:
         """Register all command and message handlers."""
         from .handlers import callback, command, message
+        from .handlers.live_streaming import LiveStreamHandler
+
+        # Initialize live stream handler
+        live_stream_handler = LiveStreamHandler(self.app)
+        message.set_live_stream_handler(live_stream_handler)
+        logger.info("Live stream handler initialized")
 
         # Command handlers
         handlers = [
@@ -114,10 +124,15 @@ class ClaudeCodeBot:
             ("cd", command.change_directory),
             ("pwd", command.print_working_directory),
             ("projects", command.show_projects),
+            ("recent", command.recent_projects),
             ("status", command.session_status),
             ("export", command.export_session),
             ("actions", command.quick_actions),
             ("git", command.git_command),
+            # Aliases
+            ("q", command.session_status),  # Quick status
+            ("s", command.session_status),  # Status
+            ("n", command.new_session),     # New session
         ]
 
         for cmd, handler in handlers:

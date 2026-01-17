@@ -8,6 +8,7 @@ from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
+from .message import _live_stream_handler
 
 logger = structlog.get_logger()
 
@@ -41,6 +42,7 @@ async def handle_callback_query(
             "conversation": handle_conversation_callback,
             "git": handle_git_callback,
             "export": handle_export_callback,
+            "cancel": handle_cancel_callback,
         }
 
         handler = handlers.get(action)
@@ -1142,6 +1144,30 @@ async def handle_export_callback(
             "Export failed", error=str(e), user_id=user_id, format=export_format
         )
         await query.edit_message_text(f"❌ **Export Failed**\n\n{str(e)}")
+
+
+async def handle_cancel_callback(
+    query, process_id: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle cancellation of Claude operations."""
+    user_id = query.from_user.id
+
+    try:
+        if _live_stream_handler:
+            # Request cancellation
+            cancelled = _live_stream_handler.request_cancel(process_id)
+
+            if cancelled:
+                await query.answer("🛑 Stopping Claude...", show_alert=True)
+                logger.info("User requested cancellation", user_id=user_id, process_id=process_id)
+            else:
+                await query.answer("⚠️ Operation not found or already completed", show_alert=True)
+        else:
+            await query.answer("❌ Cancellation not available", show_alert=True)
+
+    except Exception as e:
+        logger.error("Error handling cancellation", error=str(e), user_id=user_id)
+        await query.answer("❌ Error cancelling operation", show_alert=True)
 
 
 def _format_file_size(size: int) -> str:

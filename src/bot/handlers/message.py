@@ -1,6 +1,7 @@
 """Message handlers for non-command inputs."""
 
 import asyncio
+import uuid
 from typing import Optional
 
 import structlog
@@ -12,8 +13,18 @@ from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.rate_limiter import RateLimiter
 from ...security.validators import SecurityValidator
+from .live_streaming import LiveStreamHandler
 
 logger = structlog.get_logger()
+
+# Global live stream handler (will be initialized by bot)
+_live_stream_handler: Optional[LiveStreamHandler] = None
+
+
+def set_live_stream_handler(handler: LiveStreamHandler):
+    """Set the global live stream handler."""
+    global _live_stream_handler
+    _live_stream_handler = handler
 
 
 async def _format_progress_update(update_obj) -> Optional[str]:
@@ -147,7 +158,30 @@ async def handle_text_message(
         # Check rate limit with estimated cost for text processing
         estimated_cost = _estimate_text_processing_cost(message_text)
 
+        # Check current usage and warn if approaching limit
         if rate_limiter:
+            try:
+                user_status = rate_limiter.get_user_status(user_id)
+                cost_usage = user_status.get("cost_usage", {})
+                current_cost = cost_usage.get("current", 0.0)
+                cost_limit = cost_usage.get("limit", settings.claude_max_cost_per_user)
+                cost_percentage = (current_cost / cost_limit) * 100 if cost_limit > 0 else 0
+
+                # Send warning if approaching limit (one-time per session)
+                if cost_percentage >= 80 and not context.user_data.get("cost_warning_sent"):
+                    warning_msg = (
+                        f"⚠️ **Budget Alert**\n\n"
+                        f"You've used {cost_percentage:.0f}% of your budget.\n"
+                        f"Current: ${current_cost:.2f} / ${cost_limit:.2f}\n\n"
+                        f"Your request will still be processed."
+                    )
+                    await update.message.reply_text(warning_msg, parse_mode="Markdown")
+                    context.user_data["cost_warning_sent"] = True
+
+            except Exception as e:
+                logger.warning("Failed to check cost usage", error=str(e))
+
+            # Check rate limit
             allowed, limit_message = await rate_limiter.check_rate_limit(
                 user_id, estimated_cost
             )
@@ -185,14 +219,46 @@ async def handle_text_message(
         # Get existing session ID
         session_id = context.user_data.get("claude_session_id")
 
-        # Enhanced stream updates handler with progress tracking
-        async def stream_handler(update_obj):
-            try:
-                progress_text = await _format_progress_update(update_obj)
-                if progress_text:
-                    await progress_msg.edit_text(progress_text, parse_mode="Markdown")
-            except Exception as e:
-                logger.warning("Failed to update progress message", error=str(e))
+        # Generate process ID for tracking and cancellation
+        process_id = str(uuid.uuid4())
+
+        # Use live stream handler if available
+        live_stream_ctx = None
+        if _live_stream_handler:
+            # Delete the initial progress message
+            await progress_msg.delete()
+
+            # Start live stream
+            live_stream_ctx = await _live_stream_handler.start_stream(
+                user_id=user_id,
+                chat_id=update.message.chat_id,
+                original_message_id=update.message.message_id,
+                process_id=process_id
+            )
+
+            # Enhanced stream updates handler with live messaging
+            async def stream_handler(update_obj):
+                try:
+                    # Check for cancellation
+                    if _live_stream_handler.is_cancelled(process_id):
+                        logger.info("Cancellation detected during stream", process_id=process_id)
+                        raise asyncio.CancelledError("User cancelled operation")
+
+                    await _live_stream_handler.handle_update(process_id, update_obj)
+                except asyncio.CancelledError:
+                    raise  # Propagate cancellation
+                except Exception as e:
+                    logger.warning("Failed to handle stream update", error=str(e))
+
+        else:
+            # Fallback to original progress message handler
+            async def stream_handler(update_obj):
+                try:
+                    progress_text = await _format_progress_update(update_obj)
+                    if progress_text:
+                        await progress_msg.edit_text(progress_text, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning("Failed to update progress message", error=str(e))
 
         # Run Claude command
         try:
@@ -203,6 +269,14 @@ async def handle_text_message(
                 session_id=session_id,
                 on_stream=stream_handler,
             )
+
+            # Finalize live stream if used
+            if live_stream_ctx:
+                await _live_stream_handler.finalize_stream(
+                    process_id,
+                    claude_response.content,
+                    is_error=False
+                )
 
             # Update session ID
             context.user_data["claude_session_id"] = claude_response.session_id
@@ -233,6 +307,26 @@ async def handle_text_message(
                 claude_response.content
             )
 
+        except asyncio.CancelledError:
+            # User cancelled the operation
+            logger.info("Claude operation cancelled by user", user_id=user_id, process_id=process_id)
+
+            if live_stream_ctx:
+                await _live_stream_handler.finalize_stream(
+                    process_id,
+                    "Operation cancelled by user",
+                    is_error=True
+                )
+            else:
+                await progress_msg.delete()
+
+            await update.message.reply_text(
+                "🛑 **Operation Cancelled**\n\n"
+                "Claude Code execution was stopped by your request.",
+                parse_mode="Markdown"
+            )
+            return
+
         except ClaudeToolValidationError as e:
             # Tool validation error with detailed instructions
             logger.error(
@@ -241,12 +335,21 @@ async def handle_text_message(
                 user_id=user_id,
                 blocked_tools=e.blocked_tools,
             )
+
+            if live_stream_ctx:
+                await _live_stream_handler.finalize_stream(process_id, str(e), is_error=True)
+
             # Error message already formatted, create FormattedMessage
             from ..utils.formatting import FormattedMessage
 
             formatted_messages = [FormattedMessage(str(e), parse_mode="Markdown")]
+
         except Exception as e:
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
+
+            if live_stream_ctx:
+                await _live_stream_handler.finalize_stream(process_id, str(e), is_error=True)
+
             # Format error and create FormattedMessage
             from ..utils.formatting import FormattedMessage
 
@@ -254,8 +357,12 @@ async def handle_text_message(
                 FormattedMessage(_format_error_message(str(e)), parse_mode="Markdown")
             ]
 
-        # Delete progress message
-        await progress_msg.delete()
+        # Delete progress message (only if not using live stream)
+        if not live_stream_ctx:
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
 
         # Send formatted responses (may be multiple messages)
         for i, message in enumerate(formatted_messages):
@@ -425,8 +532,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Send processing indicator
         await update.message.chat.send_action("upload_document")
 
+        # Show file preview first
+        file_size_mb = document.file_size / (1024 * 1024)
+        preview_text = (
+            f"📄 **File Received**\n\n"
+            f"**Name:** `{document.file_name}`\n"
+            f"**Size:** {document.file_size / 1024:.1f} KB ({file_size_mb:.2f} MB)\n"
+            f"**Type:** {document.mime_type or 'Unknown'}\n\n"
+            f"⏳ Processing..."
+        )
+
         progress_msg = await update.message.reply_text(
-            f"📄 Processing file: `{document.file_name}`...", parse_mode="Markdown"
+            preview_text, parse_mode="Markdown"
         )
 
         # Check if enhanced file handler is available
@@ -464,6 +581,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # Try to decode as text
             try:
                 content = file_bytes.decode("utf-8")
+
+                # Show file preview (first few lines)
+                lines = content.split("\n")
+                preview_lines = lines[:10]
+                preview_content = "\n".join(preview_lines)
+                if len(lines) > 10:
+                    preview_content += f"\n... ({len(lines) - 10} more lines)"
+
+                # Update preview with content
+                preview_text = (
+                    f"📄 **File Preview**\n\n"
+                    f"**Name:** `{document.file_name}`\n"
+                    f"**Size:** {document.file_size / 1024:.1f} KB\n"
+                    f"**Lines:** {len(lines)}\n\n"
+                    f"**Preview:**\n```\n{preview_content[:200]}{'...' if len(preview_content) > 200 else ''}\n```\n\n"
+                    f"⏳ Sending to Claude..."
+                )
+                await progress_msg.edit_text(preview_text, parse_mode="Markdown")
 
                 # Check content length
                 max_content_length = 50000  # 50KB of text

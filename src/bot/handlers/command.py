@@ -575,8 +575,86 @@ async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.error("Error in show_projects command", error=str(e))
 
 
+async def recent_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /recent command to show recently accessed projects."""
+    user_id = update.effective_user.id
+    settings: Settings = context.bot_data["settings"]
+    storage = context.bot_data.get("storage")
+
+    try:
+        # Get recent projects from user session history
+        recent = []
+
+        # Try to get from storage if available
+        if storage and hasattr(storage, "get_user_recent_directories"):
+            recent = await storage.get_user_recent_directories(user_id, limit=5)
+
+        # Fall back to user_data
+        if not recent:
+            recent_dirs = context.user_data.get("recent_directories", [])
+            recent = recent_dirs[:5] if recent_dirs else []
+
+        # Add current directory if not in recent
+        current_dir = context.user_data.get("current_directory", settings.approved_directory)
+        if current_dir and current_dir not in recent:
+            recent.insert(0, current_dir)
+
+        if not recent or len(recent) == 0:
+            await update.message.reply_text(
+                "⏱️ **No Recent Projects**\n\n"
+                "You haven't accessed any projects yet.\n\n"
+                "**Get started:**\n"
+                "• Use `/projects` to see all projects\n"
+                "• Use `/cd <project>` to navigate"
+            )
+            return
+
+        # Format recent projects
+        recent_text = "⏱️ **Recent Projects**\n\n"
+        keyboard = []
+
+        for i, path in enumerate(recent[:5], 1):
+            try:
+                relative_path = path.relative_to(settings.approved_directory)
+                project_name = relative_path.parts[0] if relative_path.parts else "root"
+
+                # Add to text list
+                is_current = (path == current_dir)
+                marker = "📍" if is_current else f"{i}."
+                recent_text += f"{marker} `{relative_path}/`\n"
+
+                # Add button
+                if not is_current:
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"{'⭐' if i == 1 else str(i)} {project_name}",
+                            callback_data=f"cd:{project_name}"
+                        )
+                    ])
+            except (ValueError, AttributeError):
+                continue
+
+        # Add navigation buttons
+        keyboard.append([
+            InlineKeyboardButton("📁 All Projects", callback_data="action:show_projects"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="action:recent"),
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            recent_text,
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error loading recent projects: {str(e)}")
+        logger.error("Error in recent_projects command", error=str(e), user_id=user_id)
+
+
 async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /status command."""
+    """Handle /status command with enhanced formatting."""
     user_id = update.effective_user.id
     settings: Settings = context.bot_data["settings"]
 
@@ -589,7 +667,9 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Get rate limiter info if available
     rate_limiter = context.bot_data.get("rate_limiter")
-    usage_info = ""
+    usage_bar = ""
+    cost_warning = ""
+
     if rate_limiter:
         try:
             user_status = rate_limiter.get_user_status(user_id)
@@ -598,54 +678,70 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             cost_limit = cost_usage.get("limit", settings.claude_max_cost_per_user)
             cost_percentage = (current_cost / cost_limit) * 100 if cost_limit > 0 else 0
 
-            usage_info = f"💰 Usage: ${current_cost:.2f} / ${cost_limit:.2f} ({cost_percentage:.0f}%)\n"
+            # Create ASCII progress bar
+            bar_length = 10
+            filled = int((cost_percentage / 100) * bar_length)
+            bar = "█" * filled + "░" * (bar_length - filled)
+
+            usage_bar = (
+                f"\n💰 **Usage:** ${current_cost:.2f} / ${cost_limit:.2f}\n"
+                f"`{bar}` {cost_percentage:.0f}%"
+            )
+
+            # Add warning if approaching limit
+            if cost_percentage >= 90:
+                cost_warning = "\n\n⚠️ **Warning:** Approaching usage limit!"
+            elif cost_percentage >= 75:
+                cost_warning = "\n\n💡 **Notice:** 75% of budget used"
+
         except Exception:
-            usage_info = "💰 Usage: _Unable to retrieve_\n"
+            usage_bar = "\n💰 **Usage:** _Unable to retrieve_"
 
-    # Format status message
-    status_lines = [
-        "📊 **Session Status**",
-        "",
-        f"📂 Directory: `{relative_path}/`",
-        f"🤖 Claude Session: {'✅ Active' if claude_session_id else '❌ None'}",
-        usage_info.rstrip(),
-        f"🕐 Last Update: {update.message.date.strftime('%H:%M:%S UTC')}",
-    ]
+    # Format status message with better structure
+    status_text = "📊 **Session Status**\n"
+    status_text += "━━━━━━━━━━━━━━━━━\n\n"
 
+    # Directory info
+    status_text += f"📂 **Directory**\n`{relative_path}/`\n\n"
+
+    # Session info
+    status_text += "🤖 **Claude Session**\n"
     if claude_session_id:
-        status_lines.append(f"🆔 Session ID: `{claude_session_id[:8]}...`")
+        status_text += f"✅ Active\n🆔 `{claude_session_id[:8]}...`\n"
+    else:
+        status_text += "❌ No active session\n"
+
+    # Usage info
+    status_text += usage_bar
+    status_text += cost_warning
+
+    # Timestamp
+    status_text += f"\n\n🕐 Updated: {update.message.date.strftime('%H:%M:%S UTC')}"
 
     # Add action buttons
     keyboard = []
     if claude_session_id:
-        keyboard.append(
-            [
-                InlineKeyboardButton("🔄 Continue", callback_data="action:continue"),
-                InlineKeyboardButton(
-                    "🆕 New Session", callback_data="action:new_session"
-                ),
-            ]
-        )
+        keyboard.append([
+            InlineKeyboardButton("🔄 Continue", callback_data="action:continue"),
+            InlineKeyboardButton("🛑 End", callback_data="action:end_session"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton("🆕 New Session", callback_data="action:new_session"),
+        ])
     else:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "🆕 Start Session", callback_data="action:new_session"
-                )
-            ]
-        )
+        keyboard.append([
+            InlineKeyboardButton("🆕 Start Session", callback_data="action:new_session")
+        ])
 
-    keyboard.append(
-        [
-            InlineKeyboardButton("📤 Export", callback_data="action:export"),
-            InlineKeyboardButton("🔄 Refresh", callback_data="action:refresh_status"),
-        ]
-    )
+    keyboard.append([
+        InlineKeyboardButton("📤 Export", callback_data="action:export"),
+        InlineKeyboardButton("🔄 Refresh", callback_data="action:refresh_status"),
+    ])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "\n".join(status_lines), parse_mode="Markdown", reply_markup=reply_markup
+        status_text, parse_mode="Markdown", reply_markup=reply_markup
     )
 
 
