@@ -154,22 +154,6 @@ async def handle_text_message(
         "Processing text message", user_id=user_id, message_length=len(message_text)
     )
 
-    # Quick responses for simple greetings (don't invoke Claude Code for these)
-    simple_greetings = {
-        "hi": "Hello! I'm your Claude Code assistant. How can I help you with coding today?",
-        "hello": "Hi there! Ready to help you code. What would you like to work on?",
-        "hey": "Hey! What coding task can I assist you with?",
-        "thanks": "You're welcome! Let me know if you need anything else.",
-        "thank you": "Happy to help! Feel free to ask if you have more questions.",
-        "bye": "Goodbye! Come back anytime you need coding help.",
-    }
-
-    # Check if message is a simple greeting (case-insensitive, stripped)
-    message_lower = message_text.lower().strip()
-    if message_lower in simple_greetings:
-        await update.message.reply_text(simple_greetings[message_lower])
-        return
-
     try:
         # Check rate limit with estimated cost for text processing
         estimated_cost = _estimate_text_processing_cost(message_text)
