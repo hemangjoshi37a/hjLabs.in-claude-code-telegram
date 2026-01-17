@@ -150,60 +150,38 @@ class LiveStreamHandler:
         context: LiveStreamContext,
         update: StreamUpdate
     ):
-        """Handle tool calls - send separate message for each tool."""
+        """Handle tool calls - update status message instead of creating new messages."""
         if not update.tool_calls:
             return
 
+        # Collect all tool names
+        tool_names = []
         for tool_call in update.tool_calls:
             tool_name = tool_call.get("name", "Unknown")
             tool_id = tool_call.get("id", str(context.tools_count))
 
-            # Create tool message
             tool_emoji = self._get_tool_emoji(tool_name)
-            tool_text = f"{tool_emoji} **Using tool: {tool_name}**\n\n_Executing..._"
+            tool_names.append(f"{tool_emoji} {tool_name}")
 
-            keyboard = [[
-                InlineKeyboardButton("🛑 Stop", callback_data=f"cancel:{context.process_id}")
-            ]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            tool_msg = await self.bot.send_message(
-                chat_id=context.chat_id,
-                text=tool_text,
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
-
-            context.tool_messages[tool_id] = tool_msg
+            # Track tool IDs for potential result updates
+            context.tool_messages[tool_id] = None
             context.tools_count += 1
-            context.messages_sent += 1
+
+        # Update status message with current tools
+        if tool_names:
+            tools_text = ", ".join(tool_names)
+            status_text = f"🔧 **Using tools:** {tools_text}\n\n_Working..._"
+            await self._update_status(context, status_text)
 
     async def _handle_tool_result(
         self,
         context: LiveStreamContext,
         update: StreamUpdate
     ):
-        """Handle tool result - update the corresponding tool message."""
-        tool_id = update.metadata.get("tool_use_id") if update.metadata else None
-        if not tool_id or tool_id not in context.tool_messages:
-            return
-
-        tool_msg = context.tool_messages[tool_id]
-        tool_name = update.metadata.get("tool_name", "Tool") if update.metadata else "Tool"
-        tool_emoji = self._get_tool_emoji(tool_name)
-
+        """Handle tool result - just update status if there's an error."""
         if update.is_error():
-            result_text = f"{tool_emoji} **{tool_name}**\n\n❌ Failed: {update.get_error_message()}"
-        else:
-            result_text = f"{tool_emoji} **{tool_name}**\n\n✅ Completed"
-
-        try:
-            await tool_msg.edit_text(
-                result_text,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.warning("Failed to edit tool message", error=str(e))
+            error_msg = update.get_error_message()
+            await self._update_status(context, f"⚠️ **Tool error:** {error_msg}")
 
     async def _handle_progress(
         self,
@@ -382,13 +360,6 @@ class LiveStreamHandler:
                     f"{icon} **Claude finished**",
                     parse_mode="Markdown"
                 )
-            except Exception:
-                pass
-
-        # Remove cancel buttons from tool messages
-        for tool_msg in context.tool_messages.values():
-            try:
-                await tool_msg.edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
 

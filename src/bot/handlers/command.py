@@ -893,8 +893,21 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         # Get context-aware actions
+        # Create a minimal session object for context
+        from ...storage.models import SessionModel
+        from datetime import datetime
+
+        temp_session = SessionModel(
+            session_id="temp",
+            user_id=user_id,
+            project_path=str(current_dir),
+            created_at=datetime.now(),
+            last_used=datetime.now()
+        )
+
         actions = await quick_action_manager.get_suggestions(
-            session_data={"working_directory": str(current_dir), "user_id": user_id}
+            session=temp_session,
+            limit=8
         )
 
         if not actions:
